@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "WebSocket 转 HTTP",
+    "description": "通过 HTTP 长轮询连接 DSH，支持实时更新、双向流和断线恢复，适用于禁用 WebSocket 的代理环境。",
+    "detail": "将 DSH 原生 Web 界面的实时流切换为同源 HTTP 长轮询，普通 RPC 继续使用原有 HTTP 接口。每个页面复用一个轮询通道，保留 DSH 原生登录、Host/Origin 与 Peer 权限校验，无需开放额外端口。启用后固定使用 HTTP 模式，不先尝试 WebSocket。"
+  }
+}
