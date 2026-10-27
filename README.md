@@ -24,6 +24,8 @@ dsh plugin --profile web add github:wlyzqm/DSH-WebSocket2HTTP#v0.1.1
 
 安装后重启正在运行的 DSH Web 服务，再刷新浏览器。使用其他 profile 时，将 `web` 换成对应名称。直接安装开发分支可使用 `github:wlyzqm/DSH-WebSocket2HTTP`。
 
+已在另一台运行 Node.js 24 的独立服务器上通过上述 GitHub 命令安装并完成禁用 WebSocket 的链路测试，见[GitHub 在线安装验收记录](./docs/GITHUB-INSTALL-VERIFICATION.md)。
+
 源码直接包含运行所需的 JavaScript，没有第三方运行依赖，不需要 `prepare`、编译或发布到 npm。`dsh plugin` 需要其安装方式提供 pnpm；具体要求见[官方打包与安装教程](https://deepseek-harness.github.io/deepseek-harness/en/develop/basic/publish)。
 
 当前通过 `engines.dsh` 精确声明受测版本。其他 DSH 版本需先验证 Connection/Gateway 接口兼容性，再扩大范围。
