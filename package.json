@@ -1,6 +1,6 @@
 {
   "name": "dsh-websocket2http",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "将 DSH Web 界面的 WebSocket 实时连接转换为 HTTP 长轮询，支持实时更新、双向流和断线恢复，适配禁用 WebSocket 的代理网络。WebSocket-to-HTTP long polling for DeepSeek Harness.",
   "author": "ZotinColin (wlyzqm)",
   "repository": {

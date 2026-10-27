@@ -6,16 +6,19 @@
   const base = new URL(script?.dataset.base || 'api/http-transport', document.baseURI).href.replace(/\/$/, '');
   if (new URL(base).origin !== location.origin) throw new Error('HTTP transport must be same-origin');
   const MAX_BUFFER_BYTES = 2 * 1024 * 1024;
+  const MAX_FRAME_BYTES = 32 * 1024 * 1024;
   const encoder = new TextEncoder();
   let current;
   let opening;
   let stopped = false;
   let nextId = 0;
+  let lastFailure;
   const counters = { sessions: 0, polls: 0, sends: 0, received: 0, failures: 0 };
 
   function carrierError(message, cause) {
     const error = new Error(`DSH HTTP transport: ${message}`, cause === undefined ? undefined : { cause });
     error.dshRemoteStreamFailure = { kind: 'carrier' };
+    if (cause?.httpTransportFailure) error.httpTransportFailure = cause.httpTransportFailure;
     return error;
   }
   function remoteError(value) {
@@ -34,8 +37,23 @@
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body), signal, keepalive,
     });
-    if (response.status !== 200) throw carrierError(`${action} returned HTTP ${response.status}`);
+    if (response.status !== 200) {
+      let body;
+      try { body = await response.json(); } catch {}
+      // Record only a short machine reason; never retain response bodies,
+      // cookies, session identifiers, or free-form server error messages.
+      const reason = typeof body?.reason === 'string' && /^[a-z0-9][a-z0-9._-]{0,63}$/i.test(body.reason)
+        ? body.reason : undefined;
+      const error = carrierError(`${action} returned HTTP ${response.status}`);
+      error.httpTransportFailure = { action, status: response.status, ...reason === undefined ? {} : { reason } };
+      throw error;
+    }
     return response.json();
+  }
+  function wakeCapacity(session) {
+    const waiting = session.capacity;
+    session.capacity = deferred();
+    waiting.resolve();
   }
   function closeRemote(session) {
     void post('close', { sessionId: session.id }, undefined, true).catch(() => {});
@@ -45,7 +63,9 @@
     session.closed = true;
     if (current === session) current = undefined;
     counters.failures++;
+    lastFailure = Object.freeze({ message: cause.message, ...cause.httpTransportFailure });
     session.abort.abort(cause);
+    wakeCapacity(session);
     for (const channel of [...session.channels.values()]) channel.finish(cause, true);
     closeRemote(session);
   }
@@ -64,9 +84,10 @@
           if (frame.type === 'error' && (!frame.error || typeof frame.error.code !== 'string' || typeof frame.error.message !== 'string')) throw carrierError('invalid stream error');
           const channel = session.channels.get(frame.streamId);
           if (channel) {
-            if (frame.type === 'item') channel.push(frame.value);
+            if (frame.type === 'item') await channel.push(frame.value);
             else channel.finish(frame.type === 'error' ? remoteError(frame.error) : undefined);
           }
+          if (session.closed) return;
           session.after = frame.seq;
           counters.received++;
         }
@@ -85,7 +106,7 @@
         if (typeof result.sessionId !== 'string' || !result.sessionId || result.sessionId.length > 256) throw carrierError('invalid session response');
         const session = {
           id: result.sessionId, after: 0, closed: false, channels: new Map(),
-          abort: new AbortController(), sends: Promise.resolve(), queuedBytes: 0, bufferedBytes: 0,
+          abort: new AbortController(), sends: Promise.resolve(), queuedBytes: 0, bufferedBytes: 0, capacity: deferred(),
         };
         if (stopped) { closeRemote(session); throw carrierError('page is closing'); }
         current = session;
@@ -130,15 +151,24 @@
     let bufferedBytes = 0;
     let input;
     const channel = {
-      push(value) {
-        if (ended) return;
+      async push(value) {
+        if (ended || session.closed) return;
+        // A waiting reader consumes this value directly, without using queue
+        // capacity. Large snapshots must not be rejected by the queue target.
+        if (readers.length) { readers.shift().resolve({ value, done: false }); return; }
         const size = encoder.encode(JSON.stringify(value) ?? 'null').byteLength;
-        if (session.bufferedBytes + size > MAX_BUFFER_BYTES) throw carrierError('downlink buffer exceeded');
-        if (readers.length) readers.shift().resolve({ value, done: false });
-        else {
-          queue.push({ value, size });
-          session.bufferedBytes += size;
-          bufferedBytes += size;
+        if (size > MAX_FRAME_BYTES) throw carrierError('downlink frame exceeds 32 MiB');
+        while (!ended && !session.closed) {
+          if (readers.length) { readers.shift().resolve({ value, done: false }); return; }
+          // One indivisible snapshot can exceed the target only when there
+          // are no queued values. Otherwise pause ACKs until consumers drain.
+          if (session.bufferedBytes === 0 || session.bufferedBytes + size <= MAX_BUFFER_BYTES) {
+            queue.push({ value, size });
+            session.bufferedBytes += size;
+            bufferedBytes += size;
+            return;
+          }
+          await session.capacity.promise;
         }
       },
       finish(error, discard = false) {
@@ -151,6 +181,7 @@
         if (session) {
           session.channels.delete(streamId);
           if (discard) { session.bufferedBytes -= bufferedBytes; bufferedBytes = 0; queue.length = 0; }
+          wakeCapacity(session);
         }
         for (const reader of readers.splice(0)) {
           if (failure) reader.reject(failure);
@@ -162,7 +193,7 @@
       if (ended) {
         // The Host can finish before the consumer drains its last items. An
         // early return must also release those already-completed queue bytes.
-        if (session) session.bufferedBytes -= bufferedBytes;
+        if (session) { session.bufferedBytes -= bufferedBytes; wakeCapacity(session); }
         bufferedBytes = 0;
         queue.length = 0;
         failure = error;
@@ -213,10 +244,14 @@
           const item = queue.shift();
           bufferedBytes -= item.size;
           session.bufferedBytes -= item.size;
+          wakeCapacity(session);
           return Promise.resolve({ value: item.value, done: false });
         }
         if (ended) return failure ? Promise.reject(failure) : Promise.resolve({ value: undefined, done: true });
-        return new Promise((resolve, reject) => readers.push({ resolve, reject }));
+        return new Promise((resolve, reject) => {
+          readers.push({ resolve, reject });
+          if (session) wakeCapacity(session);
+        });
       },
       return() {
         cancel();
@@ -234,7 +269,7 @@
     value: Object.freeze({
       mode: 'http-long-poll',
       snapshot: () => Object.freeze({
-        ...counters, connected: Boolean(current && !current.closed),
+        ...counters, ...lastFailure === undefined ? {} : { lastFailure }, connected: Boolean(current && !current.closed),
         streams: current?.channels.size || 0, bufferedBytes: current?.bufferedBytes || 0,
       }),
     }),

@@ -8,7 +8,7 @@ import { HttpTransport, BASE } from './host.js';
 async function fixture(t, options = {}) {
   const peerAbort = new AbortController();
   const peer = { id: 'browser-owner', signal: peerAbort.signal };
-  const observations = { opened: 0, cleaned: 0, peers: [] };
+  const observations = { opened: 0, cleaned: 0, produced: 0, peers: [] };
   const connection = {
     admit(req) {
       if (req.headers.origin && req.headers.origin !== 'https://dsh.test') return { rejection: 403 };
@@ -26,7 +26,14 @@ async function fixture(t, options = {}) {
           if (endpoint === 'test/burst') {
             for (const value of payload.values) yield value;
           } else if (endpoint === 'test/large') {
-            yield 'x'.repeat(2 * 1024 * 1024);
+            yield 'x'.repeat(3 * 1024 * 1024);
+          } else if (endpoint === 'test/chunked') {
+            for (let n = 0; n < payload.count; n++) {
+              observations.produced++;
+              yield { chunk: n, text: 'x'.repeat(512 * 1024) };
+            }
+          } else if (endpoint === 'test/oversize') {
+            yield 'x'.repeat(33 * 1024 * 1024);
           } else if (endpoint === 'test/echo') {
             for await (const value of uplink) yield { echo: value };
           } else if (endpoint === 'test/fail') {
@@ -89,7 +96,7 @@ async function fixture(t, options = {}) {
     server.closeAllConnections();
     await new Promise(resolve => server.close(resolve));
   });
-  return { request, open, send, collect, peer, peerAbort, observations, transport };
+  return { request, open, send, collect, connection, peer, peerAbort, observations, transport };
 }
 
 test('admission protects bootstrap and actions, including forged forwarding headers', async t => {
@@ -192,11 +199,141 @@ test('session and uplink limits fail closed and release capacity', async t => {
   await f.open();
 });
 
-test('downlink overflow expires the session rather than dropping unseen frames', async t => {
+test('large bursts wait for ACK without expiring the session or losing frames', async t => {
   const f = await fixture(t);
   const sessionId = await f.open();
-  await f.send(sessionId, [{ type: 'open', streamId: 'huge', endpoint: 'test/large', payload: {} }]);
-  assert.equal((await f.request('/poll', { sessionId, after: 0 })).status, 410);
+  await f.send(sessionId, [{ type: 'open', streamId: 'burst', endpoint: 'test/chunked', payload: { count: 10 } }]);
+  const session = f.transport.sessions.get(sessionId);
+  assert.ok(session.writers.size > 0, 'producer should wait when the ACK window is full');
+  assert.ok(f.observations.produced < 10, 'must not eagerly read the entire source');
+  assert.ok(session.queueBytes <= 2 * 1024 * 1024);
+  const { frames } = await f.collect(sessionId, 11);
+  assert.deepEqual(frames.filter(x => x.type === 'item').map(x => x.value.chunk), [...Array(10).keys()]);
+  assert.deepEqual(frames.map(x => x.seq), [...Array(11)].map((_, n) => n + 1));
+  assert.equal(frames.at(-1).type, 'end');
+  assert.equal(f.transport.sessions.size, 1);
+  assert.deepEqual(f.transport.metrics.closedReasons, {});
+  assert.ok(f.transport.metrics.peakQueuedBytes <= 2 * 1024 * 1024);
+});
+
+test('one snapshot over 2 MiB is delivered and replayable until acknowledged', async t => {
+  const f = await fixture(t);
+  const sessionId = await f.open();
+  await f.send(sessionId, [{ type: 'open', streamId: 'large', endpoint: 'test/large', payload: {} }]);
+  const first = await f.request('/poll', { sessionId, after: 0 });
+  assert.equal(first.status, 200);
+  assert.equal(first.body.frames.length, 1);
+  assert.equal(first.body.frames[0].value.length, 3 * 1024 * 1024);
+  const replay = await f.request('/poll', { sessionId, after: 0 });
+  assert.deepEqual(replay.body, first.body);
+  const last = await f.request('/poll', { sessionId, after: first.body.cursor });
+  assert.equal(last.status, 200);
+  assert.equal(last.body.frames[0].type, 'end');
+  assert.equal(f.transport.sessions.size, 1);
+});
+
+test('cancelling a producer blocked on downlink capacity releases its iterator', async t => {
+  const f = await fixture(t);
+  const sessionId = await f.open();
+  await f.send(sessionId, [{ type: 'open', streamId: 'blocked', endpoint: 'test/chunked', payload: { count: 10 } }]);
+  const session = f.transport.sessions.get(sessionId);
+  assert.ok(session.writers.size > 0);
+  await f.send(sessionId, [{ type: 'cancel', streamId: 'blocked' }]);
+  assert.equal(session.writers.size, 0);
+  assert.equal(f.observations.cleaned, 1);
+  assert.equal(session.streams.size, 0);
+  assert.equal(f.transport.sessions.size, 1);
+});
+
+test('closing and disposing sessions unlock blocked producers without orphan tasks', async t => {
+  const f = await fixture(t);
+  for (const action of ['close', 'dispose']) {
+    const sessionId = await f.open();
+    await f.send(sessionId, [{ type: 'open', streamId: 'blocked', endpoint: 'test/chunked', payload: { count: 10 } }]);
+    const session = f.transport.sessions.get(sessionId);
+    assert.ok(session.writers.size > 0);
+    if (action === 'close') await f.request('/close', { sessionId });
+    else await f.transport.dispose();
+    for (let n = 0; n < 20 && f.transport.tasks.size; n++) await delay(1);
+    assert.equal(session.writers.size, 0);
+    assert.equal(f.transport.tasks.size, 0);
+    assert.equal(session.streams.size, 0);
+  }
+  assert.equal(f.transport.metrics.closedReasons['caller-close'], 1);
+  assert.equal(f.transport.metrics.closedReasons.dispose, 1);
+});
+
+test('a frame beyond 32 MiB fails only its logical stream with an explicit error', async t => {
+  const f = await fixture(t);
+  const sessionId = await f.open();
+  await f.send(sessionId, [{ type: 'open', streamId: 'too-large', endpoint: 'test/oversize', payload: {} }]);
+  const first = await f.request('/poll', { sessionId, after: 0 });
+  assert.equal(first.status, 200);
+  assert.equal(first.body.frames[0].type, 'error');
+  assert.equal(first.body.frames[0].error.code, 'transport/frame-too-large');
+  assert.equal(first.body.frames[0].error.details.maxFrameBytes, 32 * 1024 * 1024);
+  await f.send(sessionId, [{ type: 'open', streamId: 'healthy', endpoint: 'test/burst', payload: { values: ['still connected'] } }]);
+  const next = await f.collect(sessionId, 2, first.body.cursor);
+  assert.equal(next.frames[0].value, 'still connected');
+  assert.equal(f.transport.sessions.size, 1);
+  assert.deepEqual(f.transport.metrics.closedReasons, {});
+});
+
+test('status explains expired-session reasons without returning binding material', async t => {
+  const f = await fixture(t);
+  const sessionId = await f.open();
+  const wrongOwner = await f.request('/poll', { sessionId, after: 0 }, { Cookie: 'dsh-auth-test=two' });
+  assert.equal(wrongOwner.status, 410);
+  assert.equal(wrongOwner.body.reason, 'owner-mismatch');
+  const missing = await f.request('/poll', { sessionId: 'unknown', after: 0 });
+  assert.equal(missing.body.reason, 'missing-session');
+  const admit = f.connection.admit;
+  f.connection.admit = req => {
+    const result = admit(req);
+    return 'peer' in result ? { peer: { ...result.peer } } : result;
+  };
+  const wrongPeer = await f.request('/poll', { sessionId, after: 0 });
+  assert.equal(wrongPeer.status, 410);
+  assert.equal(wrongPeer.body.reason, 'peer-mismatch');
+  f.connection.admit = admit;
+  await f.request('/close', { sessionId });
+  const status = (await f.request('/status', {}, {}, 'GET')).body;
+  assert.deepEqual(status.rejectionReasons, { 'owner-mismatch': 1, 'missing-session': 1, 'peer-mismatch': 1 });
+  assert.deepEqual(status.closedReasons, { 'caller-close': 1 });
+  assert.deepEqual(status.lastClose, { reason: 'caller-close', queuedBytes: 0, streams: 0 });
+  const serialized = JSON.stringify(status);
+  assert.equal(serialized.includes(sessionId), false);
+  assert.equal(serialized.includes('dsh-auth-test'), false);
+  assert.equal(serialized.includes('browser-owner'), false);
+});
+
+test('idle cleanup records the reason and wakes a producer waiting for ACK', async t => {
+  const f = await fixture(t, { idleMs: 25 });
+  const sessionId = await f.open();
+  await f.send(sessionId, [{ type: 'open', streamId: 'blocked', endpoint: 'test/chunked', payload: { count: 10 } }]);
+  const session = f.transport.sessions.get(sessionId);
+  assert.ok(session.writers.size > 0);
+  for (let n = 0; n < 50 && f.transport.tasks.size; n++) await delay(5);
+  assert.equal(f.transport.tasks.size, 0);
+  assert.equal(session.writers.size, 0);
+  assert.equal(f.observations.cleaned, 1);
+  assert.equal(f.transport.metrics.closedReasons.idle, 1);
+  assert.equal(f.transport.metrics.lastClose.reason, 'idle');
+  assert.ok(f.transport.metrics.lastClose.queuedBytes > 0);
+});
+
+test('Peer disposal wakes a producer waiting for ACK', async t => {
+  const f = await fixture(t);
+  const sessionId = await f.open();
+  await f.send(sessionId, [{ type: 'open', streamId: 'blocked', endpoint: 'test/chunked', payload: { count: 10 } }]);
+  const session = f.transport.sessions.get(sessionId);
+  assert.ok(session.writers.size > 0);
+  f.peerAbort.abort();
+  for (let n = 0; n < 20 && f.transport.tasks.size; n++) await delay(1);
+  assert.equal(f.transport.tasks.size, 0);
+  assert.equal(session.writers.size, 0);
+  assert.equal(f.observations.cleaned, 1);
+  assert.equal(f.transport.metrics.closedReasons['peer-disposed'], 1);
 });
 
 test('peer disposal closes pending polls and releases every active stream', async t => {
@@ -209,8 +346,11 @@ test('peer disposal closes pending polls and releases every active stream', asyn
     await delay(2);
   }
   f.peerAbort.abort();
-  assert.equal((await pending).status, 410);
+  const lost = await pending;
+  assert.equal(lost.status, 410);
+  assert.equal(lost.body.reason, 'peer-disposed');
   await f.transport.dispose();
   assert.equal(f.observations.cleaned, 1);
   assert.equal((await f.request('/status', {}, {}, 'GET')).body.activeSessions, 0);
+  assert.equal(f.transport.metrics.closedReasons['peer-disposed'], 1);
 });

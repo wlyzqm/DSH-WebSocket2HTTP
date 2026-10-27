@@ -34,7 +34,7 @@ function browser() {
       const body = JSON.parse(options.body);
       const action = new URL(url).pathname.split('/').pop();
       requests.push({ action, body, options });
-      const response = body => ({ status: 200, json: async () => body });
+      const response = (body, status = 200) => ({ status, json: async () => body });
       if (action === 'open') return response({ sessionId: `session-${++sessionCount}` });
       if (action === 'send' || action === 'close') return response({ ok: true });
       if (action !== 'poll') throw Error('Unexpected action');
@@ -43,6 +43,7 @@ function browser() {
           sessionId: body.sessionId,
           after: body.after,
           reply: value => { remove(); resolve(response(value)); },
+          httpError: (status, value) => { remove(); resolve(response(value, status)); },
           fail: error => { remove(); reject(error); },
         };
         const remove = () => {
@@ -201,4 +202,125 @@ test('BFCache restore permits a new generation and every later pagehide still cl
   b.close();
   await lostAgain;
   assert.equal(b.context.__DSH_HTTP_TRANSPORT__.snapshot().connected, false);
+});
+
+test('delivers a multi-megabyte snapshot directly to an already waiting reader', async () => {
+  const b = browser();
+  const stream = b.open('session/follow', { args: {} }, new AbortController().signal);
+  const read = stream.next();
+  await until(() => b.frames().length === 1);
+  const value = 'x'.repeat(3 * 1024 * 1024);
+  b.polls[0].reply({ frames: [{ seq: 1, type: 'item', streamId: b.frames()[0].streamId, value }], cursor: 1 });
+  assert.equal((await read).value, value);
+  await until(() => b.polls[0]?.after === 1);
+  const state = b.context.__DSH_HTTP_TRANSPORT__.snapshot();
+  assert.equal(state.failures, 0);
+  assert.equal(state.bufferedBytes, 0);
+  await stream.return();
+  b.close();
+});
+
+test('pauses acknowledgement for a slow consumer instead of failing a full downlink queue', async () => {
+  const b = browser();
+  const stream = b.open('session/follow', { args: {} }, new AbortController().signal);
+  await until(() => b.frames().length === 1);
+  const streamId = b.frames()[0].streamId;
+  const values = Array.from({ length: 6 }, (_, i) => `${i}${'x'.repeat(512 * 1024)}`);
+  b.polls[0].reply({ frames: [
+    ...values.map((value, i) => ({ seq: i + 1, type: 'item', streamId, value })),
+    { seq: 7, type: 'end', streamId },
+  ], cursor: 7 });
+  await until(() => b.context.__DSH_HTTP_TRANSPORT__.snapshot().received === 3);
+  assert.equal(b.polls.length, 0, 'a blocked batch must not be acknowledged prematurely');
+  assert.equal(b.requests.filter(r => r.action === 'poll').length, 1);
+  assert.ok(b.context.__DSH_HTTP_TRANSPORT__.snapshot().bufferedBytes <= 2 * 1024 * 1024);
+  for (const value of values) assert.equal((await stream.next()).value, value);
+  await until(() => b.polls[0]?.after === 7);
+  assert.equal((await stream.next()).done, true);
+  assert.equal(b.context.__DSH_HTTP_TRANSPORT__.snapshot().failures, 0);
+  assert.equal(b.context.__DSH_HTTP_TRANSPORT__.snapshot().bufferedBytes, 0);
+  b.close();
+});
+
+test('cancelling a full queue unblocks the poll and delivers other logical streams', async () => {
+  const b = browser();
+  const slow = b.open('session/follow', { args: {} }, new AbortController().signal);
+  const fast = b.open('$events', { args: {} }, new AbortController().signal);
+  const read = fast.next();
+  await until(() => b.frames().length === 2);
+  const [slowId, fastId] = b.frames().map(f => f.streamId);
+  b.polls[0].reply({ frames: [
+    ...Array.from({ length: 4 }, (_, i) => ({ seq: i + 1, type: 'item', streamId: slowId, value: 'x'.repeat(512 * 1024) })),
+    { seq: 5, type: 'item', streamId: fastId, value: 'still connected' },
+  ], cursor: 5 });
+  await until(() => b.context.__DSH_HTTP_TRANSPORT__.snapshot().received === 3);
+  await slow.return();
+  assert.equal((await read).value, 'still connected');
+  await until(() => b.polls[0]?.after === 5);
+  assert.equal(b.context.__DSH_HTTP_TRANSPORT__.snapshot().bufferedBytes, 0);
+  assert.equal(b.context.__DSH_HTTP_TRANSPORT__.snapshot().failures, 0);
+  await fast.return();
+  b.close();
+});
+
+test('page shutdown releases a poll waiting for downlink capacity', async () => {
+  const b = browser();
+  b.open('session/follow', { args: {} }, new AbortController().signal);
+  await until(() => b.frames().length === 1);
+  const streamId = b.frames()[0].streamId;
+  b.polls[0].reply({ frames: Array.from({ length: 4 }, (_, i) => ({
+    seq: i + 1, type: 'item', streamId, value: 'x'.repeat(512 * 1024),
+  })), cursor: 4 });
+  await until(() => b.context.__DSH_HTTP_TRANSPORT__.snapshot().received === 3);
+  b.close();
+  await tick();
+  assert.equal(b.context.__DSH_HTTP_TRANSPORT__.snapshot().connected, false);
+  assert.equal(b.context.__DSH_HTTP_TRANSPORT__.snapshot().bufferedBytes, 0);
+  assert.equal(b.requests.filter(r => r.action === 'poll').length, 1);
+});
+
+test('HTTP 410 preserves only safe diagnostic facts and the next generation recovers', async () => {
+  const b = browser();
+  const first = b.open('$events', { args: {} }, new AbortController().signal);
+  const lost = assert.rejects(first.next(), error => error.dshRemoteStreamFailure.kind === 'carrier');
+  await until(() => b.frames().length === 1);
+  b.polls[0].httpError(410, { reason: 'downlink-overflow', error: 'transport session expired', cookie: 'never retain this' });
+  await lost;
+  const state = b.context.__DSH_HTTP_TRANSPORT__.snapshot();
+  assert.equal(state.lastFailure.status, 410);
+  assert.equal(state.lastFailure.action, 'poll');
+  assert.equal(state.lastFailure.reason, 'downlink-overflow');
+  assert.equal(JSON.stringify(state).includes('never retain this'), false);
+  assert.equal(JSON.stringify(state).includes('session-1'), false);
+  const recovered = b.open('$events', { args: {} }, new AbortController().signal);
+  const ready = recovered.next();
+  await until(() => b.frames().length === 2 && b.polls[0]?.sessionId === 'session-2');
+  b.polls[0].reply({ frames: [{ seq: 1, type: 'item', streamId: b.frames()[1].streamId, value: 'ready' }], cursor: 1 });
+  assert.equal((await ready).value, 'ready');
+  assert.equal(b.context.__DSH_HTTP_TRANSPORT__.snapshot().failures, 1);
+  assert.equal(b.context.__DSH_HTTP_TRANSPORT__.snapshot().connected, true);
+  await recovered.return();
+  b.close();
+});
+
+test('buffers one indivisible large snapshot in an empty queue and resumes after it is read', async () => {
+  const b = browser();
+  const stream = b.open('session/follow', { args: {} }, new AbortController().signal);
+  await until(() => b.frames().length === 1);
+  const streamId = b.frames()[0].streamId;
+  const large = 'snapshot'.repeat(400 * 1024);
+  b.polls[0].reply({ frames: [{ seq: 1, type: 'item', streamId, value: large }], cursor: 1 });
+  await until(() => b.polls[0]?.after === 1);
+  assert.ok(b.context.__DSH_HTTP_TRANSPORT__.snapshot().bufferedBytes > 2 * 1024 * 1024);
+  b.polls[0].reply({ frames: [{ seq: 2, type: 'item', streamId, value: 'incremental update' }], cursor: 2 });
+  await tick();
+  assert.equal(b.polls.length, 0);
+  assert.equal(b.context.__DSH_HTTP_TRANSPORT__.snapshot().received, 1);
+  assert.equal((await stream.next()).value, large);
+  assert.equal((await stream.next()).value, 'incremental update');
+  await until(() => b.polls[0]?.after === 2);
+  assert.equal(b.context.__DSH_HTTP_TRANSPORT__.snapshot().failures, 0);
+  assert.equal(b.context.__DSH_HTTP_TRANSPORT__.snapshot().bufferedBytes, 0);
+  await stream.return();
+  b.close();
 });

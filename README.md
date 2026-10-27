@@ -9,7 +9,7 @@ WebSocket-to-HTTP long polling for the native DeepSeek Harness Web GUI. One poll
 | 显示名称 | WebSocket 转 HTTP |
 | 插件 ID／组件 ID | `dsh-websocket2http` |
 | 作者 | [ZotinColin／wlyzqm](https://github.com/wlyzqm) |
-| 当前版本 | `0.1.1` |
+| 当前版本 | `0.1.2` |
 | 已验证 DSH | `0.2.1-rc.2` |
 | Node.js | 22 或更高版本 |
 | 许可证 | [MIT](./LICENSE) |
@@ -19,12 +19,12 @@ WebSocket-to-HTTP long polling for the native DeepSeek Harness Web GUI. One poll
 在安装了 DSH 的机器上运行：
 
 ```bash
-dsh plugin --profile web add github:wlyzqm/DSH-WebSocket2HTTP#v0.1.1
+dsh plugin --profile web add github:wlyzqm/DSH-WebSocket2HTTP#v0.1.2
 ```
 
 安装后重启正在运行的 DSH Web 服务，再刷新浏览器。使用其他 profile 时，将 `web` 换成对应名称。直接安装开发分支可使用 `github:wlyzqm/DSH-WebSocket2HTTP`。
 
-已在另一台运行 Node.js 24 的独立服务器上通过上述 GitHub 命令安装并完成禁用 WebSocket 的链路测试，见[GitHub 在线安装验收记录](./docs/GITHUB-INSTALL-VERIFICATION.md)。
+GitHub 来源安装流程已在另一台运行 Node.js 24 的独立服务器上验证（记录基于 v0.1.1）；见[GitHub 在线安装验收记录](./docs/GITHUB-INSTALL-VERIFICATION.md)。
 
 源码直接包含运行所需的 JavaScript，没有第三方运行依赖，不需要 `prepare`、编译或发布到 npm。`dsh plugin` 需要其安装方式提供 pnpm；具体要求见[官方打包与安装教程](https://deepseek-harness.github.io/deepseek-harness/en/develop/basic/publish)。
 
@@ -51,7 +51,7 @@ dsh plugin --profile web add github:wlyzqm/DSH-WebSocket2HTTP#v0.1.1
 | 上行数据、半关闭及取消 | 有序 HTTP POST |
 | 断线及服务重启 | DSH 原有连接代次与基线恢复机制 |
 
-每次轮询最多等待 20 秒，返回完整 JSON。下行保留到客户端确认，重复帧去重；序号缺口或缓冲超限会结束当前连接，由 DSH 重新获取基线。上行操作不会盲目重放。页面离开时尝试关闭连接，空闲会话在 65 秒后释放，从 BFCache 返回时允许重新连接。
+每次轮询最多等待 20 秒，返回完整 JSON。下行保留到客户端确认，重复帧去重；生产者根据确认进度等待可用容量，慢网络或慢消费者不会因普通缓冲积压而被销毁会话。常规队列目标为 2 MiB，空队列允许单个最大 32 MiB 的快照；超出单帧上限时仅返回该逻辑流的明确错误。序号缺口仍会结束当前连接并由 DSH 重新获取基线。上行操作不会盲目重放。页面离开时尝试关闭连接，空闲会话在 65 秒后释放，从 BFCache 返回时允许重新连接。
 
 ## 代理与认证
 
@@ -69,7 +69,7 @@ HTTP 后端经 HTTPS 反代时，建议按[官方公网部署要求](https://git
 __DSH_HTTP_TRANSPORT__.snapshot()
 ```
 
-`connected: true` 表示 HTTP 传输会话已建立。`streams` 是活跃逻辑流数，`sessions` 在重连后增加；快照不包含凭证或会话 ID。也可通过已认证的 `GET /api/http-transport/status` 查看服务端计数。未登录返回 401，非法来源返回 403。
+`connected: true` 表示 HTTP 传输会话已建立。`streams` 是活跃逻辑流数，`sessions` 在重连后增加；`lastFailure` 只记录最近失败的操作、状态码和短原因代码，不包含凭证或会话 ID。服务端状态同时提供 `closedReasons`、`rejectionReasons`、`peakQueuedBytes`，用于区分容量、过期和认证绑定问题。也可通过已认证的 `GET /api/http-transport/status` 查看服务端计数。未登录返回 401，非法来源返回 403。
 
 ## 本地开发与测试
 
@@ -82,7 +82,7 @@ dsh plugin --profile web add "link:$PWD"
 
 修改后重启 DSH，再刷新页面。测试使用 Node 内置测试框架和虚拟或本机 HTTP 服务，无需模型凭证。
 
-已通过 16 项自动测试，以及在浏览器 WebSocket 构造器被阻断条件下的公网 HTTPS 界面、真实终端双向传输、取消和服务重启恢复验证。详见[验收说明](./docs/VERIFICATION.md)。模型回复没有作为此次验收的一部分。
+当前通过 30 项自动测试，包括真实 HTTP 承载 3 MiB 快照与并发突发数据的回归联调；另已完成在浏览器 WebSocket 构造器被阻断条件下的公网 HTTPS 界面、真实终端双向传输、取消和服务重启恢复验证。详见[验收说明](./docs/VERIFICATION.md)。模型回复没有作为此次验收的一部分。
 
 ## 停用或卸载
 

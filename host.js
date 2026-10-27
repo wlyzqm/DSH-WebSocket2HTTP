@@ -3,8 +3,11 @@ import { createHash, randomBytes } from 'node:crypto';
 export const BASE = '/api/http-transport';
 const BODY_LIMIT = 1024 * 1024;
 const QUEUE_LIMIT = 2 * 1024 * 1024;
+const FRAME_LIMIT = 32 * 1024 * 1024;
 const UPLINK_LIMIT = 256 * 1024;
-const fail = (status, message) => Object.assign(new Error(message), { status });
+const fail = (status, message, reason) => Object.assign(new Error(message), {
+  status, ...(reason === undefined ? {} : { reason }),
+});
 const bytes = value => Buffer.byteLength(JSON.stringify(value) ?? 'null');
 
 function reply(res, status, body, type = 'application/json; charset=utf-8') {
@@ -81,7 +84,10 @@ class Uplink {
 export class HttpTransport {
   sessions = new Map();
   tasks = new Set();
-  metrics = { sessionsOpened: 0, polls: 0, framesReceived: 0, framesSent: 0 };
+  metrics = {
+    sessionsOpened: 0, polls: 0, framesReceived: 0, framesSent: 0,
+    closedReasons: {}, rejectionReasons: {}, peakQueuedBytes: 0, lastClose: null,
+  };
   constructor(connection, gateway, { pollMs = 20_000, idleMs = 65_000, maxSessions = 32 } = {}) {
     this.connection = connection;
     this.gateway = gateway;
@@ -90,7 +96,7 @@ export class HttpTransport {
     this.maxSessions = maxSessions;
     this.sweep = setInterval(() => {
       for (const session of this.sessions.values()) {
-        if (Date.now() - session.lastSeen > this.idleMs) this.close(session);
+        if (Date.now() - session.lastSeen > this.idleMs) this.close(session, 'idle');
       }
     }, Math.min(15_000, idleMs)).unref();
   }
@@ -104,7 +110,7 @@ export class HttpTransport {
         return reply(res, 200, script, 'text/javascript; charset=utf-8');
       }
       if (req.method === 'GET' && action === '/status') {
-        return reply(res, 200, { mode: 'http-long-poll', version: '0.1.1', ...this.metrics,
+        return reply(res, 200, { mode: 'http-long-poll', version: '0.1.2', ...this.metrics,
           activeSessions: this.sessions.size,
           activeStreams: [...this.sessions.values()].reduce((n, s) => n + s.streams.size, 0) });
       }
@@ -117,26 +123,33 @@ export class HttpTransport {
         const session = {
           id: randomBytes(24).toString('base64url'), owner, peer: admission.peer,
           streams: new Map(), queue: [], queueBytes: 0, seq: 0, acknowledged: 0,
-          lastSeen: Date.now(), closed: false, poll: undefined,
+          lastSeen: Date.now(), closed: false, poll: undefined, writers: new Set(),
         };
-        session.onPeerAbort = () => this.close(session);
+        session.onPeerAbort = () => this.close(session, 'peer-disposed');
         admission.peer.signal.addEventListener('abort', session.onPeerAbort, { once: true });
         this.sessions.set(session.id, session);
         this.metrics.sessionsOpened++;
         return reply(res, 200, { sessionId: session.id });
       }
       const session = this.sessions.get(body.sessionId);
-      if (!session || session.owner !== owner || session.peer !== admission.peer) throw fail(410, 'transport session expired');
+      const rejection = !session ? 'missing-session'
+        : session.peer !== admission.peer ? 'peer-mismatch'
+        : session.owner !== owner ? 'owner-mismatch' : undefined;
+      if (rejection) {
+        this.metrics.rejectionReasons[rejection] = (this.metrics.rejectionReasons[rejection] ?? 0) + 1;
+        throw fail(410, 'transport session expired', rejection);
+      }
       session.lastSeen = Date.now();
       if (action === '/close') {
-        this.close(session);
+        this.close(session, 'caller-close');
         return reply(res, 200, { ok: true });
       }
       if (action === '/poll') return this.poll(session, body.after, res);
       this.send(session, body.frames);
       return reply(res, 200, { ok: true });
     } catch (error) {
-      reply(res, error.status ?? 500, { error: error.status ? error.message : 'HTTP transport failed' });
+      reply(res, error.status ?? 500, { error: error.status ? error.message : 'HTTP transport failed',
+        ...(error.reason === undefined ? {} : { reason: error.reason }) });
     }
   }
 
@@ -175,7 +188,7 @@ export class HttpTransport {
         }
       }
     } catch (error) {
-      this.close(session);
+      this.close(session, 'protocol-error');
       throw error;
     }
   }
@@ -186,12 +199,18 @@ export class HttpTransport {
         stream.uplink, session.peer, stream.abort.signal);
       for await (const value of source) {
         if (stream.abort.signal.aborted || session.closed) break;
-        this.enqueue(session, { type: 'item', streamId: stream.id, ...(value === undefined ? {} : { value }) });
+        if (!await this.enqueue(session, { type: 'item', streamId: stream.id,
+          ...(value === undefined ? {} : { value }) }, stream.abort.signal)) break;
       }
-      if (!stream.abort.signal.aborted && !session.closed) this.enqueue(session, { type: 'end', streamId: stream.id });
+      if (!stream.abort.signal.aborted && !session.closed) {
+        await this.enqueue(session, { type: 'end', streamId: stream.id }, stream.abort.signal);
+      }
     } catch (error) {
       if (!stream.abort.signal.aborted && !session.closed) {
-        this.enqueue(session, { type: 'error', streamId: stream.id, error: this.gateway.wireStream.failure(error) });
+        const failure = error.code === 'transport/frame-too-large'
+          ? { code: error.code, message: error.message, details: { maxFrameBytes: FRAME_LIMIT } }
+          : this.gateway.wireStream.failure(error);
+        await this.enqueue(session, { type: 'error', streamId: stream.id, error: failure }, stream.abort.signal);
       }
     } finally {
       session.streams.delete(stream.id);
@@ -199,15 +218,42 @@ export class HttpTransport {
     }
   }
 
-  enqueue(session, frame) {
-    if (session.closed) return;
-    const item = { seq: ++session.seq, ...frame };
-    const size = bytes(item);
-    if (session.queueBytes + size > QUEUE_LIMIT) { this.close(session); return; }
-    session.queue.push({ item, size });
-    session.queueBytes += size;
-    this.metrics.framesSent++;
-    session.poll?.flush();
+  async enqueue(session, frame, signal) {
+    while (!session.closed && !signal?.aborted) {
+      const item = { seq: session.seq + 1, ...frame };
+      const size = bytes(item);
+      if (size > FRAME_LIMIT) {
+        throw Object.assign(new Error('Remote stream frame exceeds the 32 MiB transport limit'), {
+          code: 'transport/frame-too-large',
+        });
+      }
+      // Keep ordinary frames inside the 2 MiB window. One large snapshot may
+      // occupy an otherwise empty queue; later frames wait for its ACK.
+      if (!session.queue.length || session.queueBytes + size <= QUEUE_LIMIT) {
+        session.seq = item.seq;
+        session.queue.push({ item, size });
+        session.queueBytes += size;
+        this.metrics.peakQueuedBytes = Math.max(this.metrics.peakQueuedBytes, session.queueBytes);
+        this.metrics.framesSent++;
+        session.poll?.flush();
+        return true;
+      }
+      await new Promise(resolve => {
+        const wake = () => {
+          session.writers.delete(wake);
+          signal?.removeEventListener('abort', wake);
+          resolve();
+        };
+        session.writers.add(wake);
+        signal?.addEventListener('abort', wake, { once: true });
+        if (session.closed || signal?.aborted) wake();
+      });
+    }
+    return false;
+  }
+
+  wakeWriters(session) {
+    for (const wake of [...session.writers]) wake();
   }
 
   poll(session, after, res) {
@@ -216,6 +262,7 @@ export class HttpTransport {
     this.metrics.polls++;
     session.acknowledged = after;
     while (session.queue.length && session.queue[0].item.seq <= after) session.queueBytes -= session.queue.shift().size;
+    this.wakeWriters(session);
     const take = () => {
       const frames = [];
       let size = 0;
@@ -237,18 +284,21 @@ export class HttpTransport {
     const onClose = () => { clearTimeout(timer); session.poll = undefined; };
     session.poll = {
       flush: () => finish(200, take()),
-      close: () => finish(410, { error: 'transport session expired' }),
+      close: reason => finish(410, { error: 'transport session expired', reason }),
     };
     res.once('close', onClose);
     timer = setTimeout(() => session.poll?.flush(), this.pollMs).unref();
   }
 
-  close(session) {
+  close(session, reason = 'caller-close') {
     if (session.closed) return;
     session.closed = true;
+    this.metrics.closedReasons[reason] = (this.metrics.closedReasons[reason] ?? 0) + 1;
+    this.metrics.lastClose = { reason, queuedBytes: session.queueBytes, streams: session.streams.size };
     this.sessions.delete(session.id);
     session.peer.signal.removeEventListener('abort', session.onPeerAbort);
-    session.poll?.close();
+    session.poll?.close(reason);
+    this.wakeWriters(session);
     for (const stream of session.streams.values()) {
       stream.abort.abort();
       void stream.uplink.return();
@@ -259,7 +309,7 @@ export class HttpTransport {
 
   async dispose() {
     clearInterval(this.sweep);
-    for (const session of this.sessions.values()) this.close(session);
+    for (const session of this.sessions.values()) this.close(session, 'dispose');
     await Promise.allSettled([...this.tasks]);
   }
 }
