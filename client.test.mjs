@@ -13,7 +13,7 @@ async function until(condition) {
   assert.fail('HTTP carrier did not reach expected state');
 }
 
-function browser() {
+function browser({ fetchTimeoutMs } = {}) {
   const requests = [];
   const polls = [];
   const listeners = new Map();
@@ -26,6 +26,18 @@ function browser() {
   let sessionCount = 0;
   const context = vm.createContext({
     URL, TextEncoder, AbortController, DOMException, console,
+    ...(fetchTimeoutMs === undefined ? { AbortSignal } : {
+      // Node 的 AbortSignal.timeout 定时器不维持事件循环，测试里改用 ref 定时器
+      // 驱动的受控信号，保证看门狗在沙箱进程内真正触发。
+      AbortSignal: {
+        timeout: () => {
+          const controller = new AbortController();
+          setTimeout(() => controller.abort(new DOMException('signal timed out', 'TimeoutError')), fetchTimeoutMs);
+          return controller.signal;
+        },
+        any: signals => AbortSignal.any(signals),
+      },
+    }),
     document: { baseURI: 'https://dsh.example/', currentScript: { dataset: { base: '/api/http-transport' } } },
     location: { origin: 'https://dsh.example' },
     __DSH_TRANSPORT__: { unrelated: 'kept' },
@@ -148,6 +160,21 @@ test('carrier failure ends every active stream and next generation creates a fre
   assert.equal(b.polls.length, 1);
   assert.equal(b.polls[0].sessionId, 'session-2');
   await recovered.return();
+  b.close();
+});
+
+test('a blackholed request fails the session via the timeout watchdog', async () => {
+  const b = browser({ fetchTimeoutMs: 25 });
+  const stream = b.open('$events', { args: {} }, new AbortController().signal);
+  const lost = assert.rejects(stream.next(), error =>
+    error.dshRemoteStreamFailure.kind === 'carrier' && /poll failed/.test(error.message));
+  await until(() => b.polls.length === 1);
+  await lost;
+  const state = b.context.__DSH_HTTP_TRANSPORT__.snapshot();
+  assert.equal(b.context.__DSH_HTTP_TRANSPORT__.patch, 'fetch-timeout');
+  assert.equal(state.connected, false);
+  assert.equal(state.failures, 1);
+  assert.match(state.lastFailure.message, /poll failed/);
   b.close();
 });
 

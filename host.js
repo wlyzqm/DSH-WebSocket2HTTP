@@ -110,7 +110,7 @@ export class HttpTransport {
         return reply(res, 200, script, 'text/javascript; charset=utf-8');
       }
       if (req.method === 'GET' && action === '/status') {
-        return reply(res, 200, { mode: 'http-long-poll', version: '0.1.2', ...this.metrics,
+        return reply(res, 200, { mode: 'http-long-poll', version: '0.1.3', ...this.metrics,
           activeSessions: this.sessions.size,
           activeStreams: [...this.sessions.values()].reduce((n, s) => n + s.streams.size, 0) });
       }

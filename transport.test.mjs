@@ -43,7 +43,7 @@ test('real HTTP carrier delivers a large snapshot and concurrent burst to slow c
     await new Promise(resolve => server.close(resolve));
   });
   context = vm.createContext({
-    URL, TextEncoder, AbortController, DOMException, console,
+    URL, TextEncoder, AbortController, AbortSignal, DOMException, console,
     document: { baseURI: origin + '/', currentScript: { dataset: { base: BASE } } },
     location: { origin },
     addEventListener: (name, listener) => events.set(name, listener),

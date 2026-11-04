@@ -31,11 +31,23 @@
     const promise = new Promise(done => { resolve = done; });
     return { promise, resolve };
   }
-  async function post(action, body, signal, keepalive = false) {
+  // Restricted-network middleboxes can blackhole a request (drop without
+  // RST/FIN), so a fetch may never settle and the native Connection has no
+  // stall watchdog. Bound every non-beacon request: a dead fetch then fails
+  // the session and the app-level retry loop rebuilds it on a fresh
+  // connection instead of freezing the page until a manual refresh.
+  function requestSignal(signal, timeoutMs) {
+    if (typeof AbortSignal.timeout !== 'function') return signal;
+    const timeout = AbortSignal.timeout(timeoutMs);
+    if (signal === undefined || typeof AbortSignal.any !== 'function') return timeout;
+    return AbortSignal.any([signal, timeout]);
+  }
+  async function post(action, body, signal, keepalive = false, timeoutMs = 30_000) {
     const response = await fetch(`${base}/${action}`, {
       method: 'POST', credentials: 'same-origin', cache: 'no-store',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body), signal, keepalive,
+      body: JSON.stringify(body), keepalive,
+      signal: keepalive ? signal : requestSignal(signal, timeoutMs),
     });
     if (response.status !== 200) {
       let body;
@@ -73,7 +85,10 @@
     try {
       while (!session.closed) {
         counters.polls++;
-        const result = await post('poll', { sessionId: session.id, after: session.after }, session.abort.signal);
+        // The server holds a poll for up to 20s before replying; 35s gives
+        // that hold plus reverse-proxy (CF edge + tunnel) latency headroom.
+        const result = await post('poll', { sessionId: session.id, after: session.after },
+          session.abort.signal, false, 35_000);
         if (session.closed) return;
         if (!Array.isArray(result.frames) || !Number.isSafeInteger(result.cursor)) throw carrierError('invalid poll response');
         for (const frame of result.frames) {
@@ -268,6 +283,7 @@
     configurable: true,
     value: Object.freeze({
       mode: 'http-long-poll',
+      patch: 'fetch-timeout',
       snapshot: () => Object.freeze({
         ...counters, ...lastFailure === undefined ? {} : { lastFailure }, connected: Boolean(current && !current.closed),
         streams: current?.channels.size || 0, bufferedBytes: current?.bufferedBytes || 0,

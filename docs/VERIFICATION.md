@@ -58,3 +58,18 @@ printf 'DSH_HTTP_%s\n' 'DUPLEX_OK'
 30 项自动测试全部通过：12 项客户端、17 项真实 HTTP Host 集成、1 项真实 Host/Client 联调。联调并发接收一个 3 MiB 快照和 16 个 512 KiB 数据块，总计 11 MiB；消费者每块延迟 5 ms。内容完整有序，仅一个会话，HTTP 全部 200，失败数为 0，两端队列不超过单个大快照；退出后会话与任务均释放。
 
 本机部署修复版并刷新原故障页面后，用户返回的诊断为：`sessions: 1`、`failures: 0`、`connected: true`、`streams: 7`、`bufferedBytes: 0`。没有把用户 Cookie、会话内容或业务会话 ID 写入此记录。
+
+## 0.1.3 请求超时看门狗
+
+生产反向代理链路（Cloudflare 边缘 + tunnel + 反代）上发现受限网络中间盒会黑洞请求：丢弃且不回 RST/FIN，浏览器 `fetch` 永不 settle。原生 Connection 没有 stall 看门狗，页面会冻结到手动刷新。
+
+该修复最初于 2026-11-03 以就地补丁形式部署在独立服务器（SZ 机）的 v0.1.2 安装实例上，仅改 `client.js`，经一周真实使用验证无回退后原样合入本仓库：
+
+| 项 | 内容 |
+| --- | --- |
+| 普通请求（open/send/close 非 beacon） | 30 秒超时 |
+| poll 长轮询 | 35 秒（服务端挂起 20 秒 + 代理链延迟余量） |
+| beacon 关闭请求（keepalive） | 不设超时，沿用原 signal |
+| 实现 | `AbortSignal.timeout` 与业务 signal 经 `AbortSignal.any` 组合 |
+
+超时触发时会话失败（carrier failure），由 DSH 原生连接层自动重建新会话；`snapshot()` 增加 `patch: 'fetch-timeout'` 运行时标记。自动测试新增"黑洞请求经看门狗失败会话"用例（注入 25 ms 短超时的 `AbortSignal` 模拟），31 项全部通过。
