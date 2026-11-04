@@ -9,8 +9,8 @@ WebSocket-to-HTTP long polling for the native DeepSeek Harness Web GUI. One poll
 | 显示名称 | WebSocket 转 HTTP |
 | 插件 ID／组件 ID | `dsh-websocket2http` |
 | 作者 | [ZotinColin／wlyzqm](https://github.com/wlyzqm) |
-| 当前版本 | `0.1.3` |
-| 已验证 DSH | `0.2.1-rc.2` |
+| 当前版本 | `0.1.4` |
+| 已验证 DSH | `0.2.1-rc.2` – `0.2.1-rc.5` |
 | Node.js | 22 或更高版本 |
 | 许可证 | [MIT](./LICENSE) |
 
@@ -19,7 +19,7 @@ WebSocket-to-HTTP long polling for the native DeepSeek Harness Web GUI. One poll
 在安装了 DSH 的机器上运行：
 
 ```bash
-dsh plugin --profile web add github:wlyzqm/DSH-WebSocket2HTTP#v0.1.3
+dsh plugin --profile web add github:wlyzqm/DSH-WebSocket2HTTP#v0.1.4
 ```
 
 安装后重启正在运行的 DSH Web 服务，再刷新浏览器。使用其他 profile 时，将 `web` 换成对应名称。直接安装开发分支可使用 `github:wlyzqm/DSH-WebSocket2HTTP`。
@@ -28,7 +28,7 @@ GitHub 来源安装流程已在另一台运行 Node.js 24 的独立服务器上�
 
 源码直接包含运行所需的 JavaScript，没有第三方运行依赖，不需要 `prepare`、编译或发布到 npm。`dsh plugin` 需要其安装方式提供 pnpm；具体要求见[官方打包与安装教程](https://deepseek-harness.github.io/deepseek-harness/en/develop/basic/publish)。
 
-当前通过 `engines.dsh` 精确声明受测版本。其他 DSH 版本需先验证 Connection/Gateway 接口兼容性，再扩大范围。
+`engines.dsh` 声明为 `>=0.2.1-rc.2 <0.3.0-0`：两端端点（`0.2.1-rc.2` 与 `0.2.1-rc.5`）均已对 Connection/Gateway/WebServer 接口逐一核验并在真实部署中运行；范围内其余 0.2.x 版本共享同一代接口，`0.3.0` 起需重新验证后再扩大范围。
 
 ## 适用场景
 

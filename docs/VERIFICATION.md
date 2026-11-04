@@ -73,3 +73,31 @@ printf 'DSH_HTTP_%s\n' 'DUPLEX_OK'
 | 实现 | `AbortSignal.timeout` 与业务 signal 经 `AbortSignal.any` 组合 |
 
 超时触发时会话失败（carrier failure），由 DSH 原生连接层自动重建新会话；`snapshot()` 增加 `patch: 'fetch-timeout'` 运行时标记。自动测试新增"黑洞请求经看门狗失败会话"用例（注入 25 ms 短超时的 `AbortSignal` 模拟），31 项全部通过。
+
+## 0.1.4 DSH 0.2.1-rc.5 兼容性核验与版本范围扩大
+
+受测环境：DSH `0.2.1-rc.5`（`dsh web` 运行时），插件以 `link:` 安装于生产 `web` profile。此前该 profile 通过版本豁免（`dsh-websocket2http@0.1.3 → 0.2.1-rc.5`）运行本插件，本次核验旨在确认真实兼容后以 `engines.dsh` 范围替代豁免。
+
+### 接口对照（rc.2 → rc.5）
+
+逐一核对本插件依赖的全部内部接口在 `0.2.1-rc.5` 实现中的签名与形状：
+
+| 依赖 | 用途 | rc.5 状态 |
+| --- | --- | --- |
+| `ctx.webServer.register({kind:'prefix', path, handler})` | 注册 `/api/http-transport` 前缀路由 | 存在，语义一致（重复路由仍抛错，最长前缀匹配） |
+| `ctx.webServer.tapIndex(transform)` | 向 `index.html` 注入客户端脚本 | 存在，仍为行渲染后的原始转换层 |
+| `ctx.connection.admit(request)` | 复用原生认证，返回 `{rejection}` 或 `{peer}` | 存在；`Peer` 仍含 `id` 与 `signal`，拒绝路径形状一致 |
+| `ctx.typertGateway.wireStream.open(endpoint, payload, uplink, peer, signal)` | 分派原有逻辑流 | 存在，参数顺序与返回的异步可迭代一致 |
+| `ctx.typertGateway.wireStream.failure(error)` | 业务错误转 RPC 失败 | 存在，仍为 `rpcError` 包装 |
+| `__DSH_TRANSPORT__.openStream(endpoint, payload, signal, uplink)` | 浏览器侧载体 | rc.5 客户端 `installConnection` 仍以相同方式读取并调用；插件以展开合并保留 `fetch`／`streamBaseUrl` 等既有字段不受影响 |
+
+### 运行时证据
+
+- 31 项自动测试在 rc.5 环境全部通过（客户端 12、真实 HTTP Host 集成 17、真实 Host/Client 联调 1、黑洞超时 1）。
+- `--dump-config` 组合中 `dsh-websocket2http` 行正常加载，未进入跳过列表；Host 日志无任何插件错误。
+- 带 `Host: <trusted-host>` 探测 `GET /api/http-transport/status`，返回本插件 `admit()` 拒绝路径的 `401 application/json`（对照：未注册的 `/api/*` 路径走 dsh-auth 303 发牌流程），证明 `register` + `admit` + 处理器管线在 rc.5 上真实工作。
+- 该生产实例即经本插件承载全部界面实时流量（本核验会话本身经此链路进行），服务重启后连接按预期恢复。
+
+### 版本范围
+
+`engines.dsh` 定为 `>=0.2.1-rc.2 <0.3.0-0`。两端端点已实测；上界同时排除 `0.3.0` 及其预发布。在 `0.2.1-rc.5` 运行时上移除版本豁免后按新范围正常加载。
